@@ -217,6 +217,10 @@ func (s *SynScanner) Scan(ctx context.Context, ports []int) (results []Result, e
 		case <-ctx.Done():
 			return results, nil
 		case err := <-errs:
+			if err == io.EOF {
+				return results, nil
+			}
+
 			return results, err
 		case r := <-ch:
 			if r == nil {
