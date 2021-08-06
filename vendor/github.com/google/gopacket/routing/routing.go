@@ -100,6 +100,9 @@ func (r *router) RouteWithSrc(input net.HardwareAddr, src, dst net.IP) (iface *n
 		ifaceIndex, gateway, preferredSrc, err = r.route(r.v6, input, src, dst)
 	default:
 		err = errors.New("IP is not valid as IPv4 or IPv6")
+	}
+
+	if err != nil {
 		return
 	}
 
@@ -211,10 +214,11 @@ loop:
 	if err != nil {
 		return nil, err
 	}
-	for i, iface := range ifaces {
-		if i != iface.Index-1 {
-			return nil, fmt.Errorf("out of order iface %d = %v", i, iface)
-		}
+	for _, iface := range ifaces {
+		// This seems unnecessary and causes issues so let's comment that out
+		// if i != iface.Index-1 {
+		//	return nil, fmt.Errorf("out of order iface %d = %v", i, iface)
+		// }
 		rtr.ifaces = append(rtr.ifaces, iface)
 		var addrs ipAddrs
 		ifaceAddrs, err := iface.Addrs()
