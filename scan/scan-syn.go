@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"sync"
 	"time"
 
 	"github.com/google/gopacket"
@@ -40,6 +39,7 @@ type SynScanner struct {
 	timeout          time.Duration
 	maxRoutines      int
 	jobChan          chan hostJob
+	done             chan struct{}
 	ti               *TargetIterator
 	serializeOptions gopacket.SerializeOptions
 }
@@ -54,8 +54,13 @@ func NewSynScanner(ti *TargetIterator, timeout time.Duration, paralellism int) *
 		timeout:     timeout,
 		maxRoutines: paralellism,
 		jobChan:     make(chan hostJob, paralellism),
+		done:        make(chan struct{}, 1),
 		ti:          ti,
 	}
+}
+
+func (s *SynScanner) Done() <-chan struct{} {
+	return s.done
 }
 
 func (s *SynScanner) Stop() {
@@ -166,67 +171,101 @@ func (s *SynScanner) send(handle *pcap.Handle, l ...gopacket.SerializableLayer) 
 	return handle.WritePacketData(buf.Bytes())
 }
 
-func (s *SynScanner) Scan(ctx context.Context, ports []int) ([]Result, error) {
+// ScanBackground performs a scan in the background, results and errors can be read from the returned channels
+func (s *SynScanner) ScanBackground(ctx context.Context, ports []int) (<-chan Result, <-chan error, error) {
+	proxy := make(chan Result)
 
-	wg := &sync.WaitGroup{}
-	resultChan := make(chan *Result)
-	results := []Result{}
-	doneChan := make(chan struct{})
+	ch, errs, err := s.scan(ctx, ports)
+	if err != nil {
+		return proxy, errs, err
+	}
 
 	go func() {
+		defer func() {
+			s.done <- struct{}{}
+		}()
+
 		for {
-			result := <-resultChan
-			if result == nil {
-				close(doneChan)
-				break
+			select {
+			case <-ctx.Done():
+				return
+			case r := <-ch:
+				if r == nil {
+					return
+				} else {
+					proxy <- *r
+				}
 			}
-			results = append(results, *result)
 		}
 	}()
 
-	for {
-		ip, err := s.ti.Next()
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, err
-		}
+	return proxy, errs, nil
+}
 
-		select {
-		case <-ctx.Done():
-			break
-		default:
-		}
+func (s *SynScanner) Scan(ctx context.Context, ports []int) (results []Result, err error) {
+	defer func() {
+		s.done <- struct{}{}
+	}()
 
-		wg.Add(1)
-		tIP := make([]byte, len(ip))
-		copy(tIP, ip)
-		go func(host net.IP, ports []int, wg *sync.WaitGroup) {
-
-			done := make(chan struct{})
-
-			s.jobChan <- hostJob{
-				resultChan: resultChan,
-				ip:         host,
-				ports:      ports,
-				done:       done,
-				ctx:        ctx,
-			}
-
-			<-done
-			wg.Done()
-		}(tIP, ports, wg)
+	ch, errs, err := s.scan(ctx, ports)
+	if err != nil {
+		return results, err
 	}
 
-	wg.Wait()
-	close(s.jobChan)
-	close(resultChan)
-	<-doneChan
+	for {
+		select {
+		case <-ctx.Done():
+			return results, nil
+		case err := <-errs:
+			return results, err
+		case r := <-ch:
+			if r == nil {
+				return
+			} else {
+				results = append(results, *r)
+			}
+		}
+	}
+}
 
-	s.Stop()
+func (s *SynScanner) scan(ctx context.Context, ports []int) (<-chan *Result, <-chan error, error) {
+	results, errs := make(chan *Result), make(chan error, 1)
 
-	return results, nil
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				if err := s.queue(ctx, ports, results); err != nil {
+					errs <- err
+				}
+			}
+		}
+	}()
+
+	return results, errs, nil
+}
+
+func (s *SynScanner) queue(ctx context.Context, ports []int, results chan *Result) (err error) {
+	ip, err := s.ti.Next()
+	if err != nil {
+		return err
+	}
+
+	done := make(chan struct{}, 1)
+
+	s.jobChan <- hostJob{
+		resultChan: results,
+		ip:         ip,
+		ports:      ports,
+		done:       done,
+		ctx:        ctx,
+	}
+
+	<-done
+
+	return nil
 }
 
 func (s *SynScanner) scanHost(job hostJob) (Result, error) {
